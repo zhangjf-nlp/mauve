@@ -10,6 +10,7 @@ import faiss
 from sklearn.preprocessing import normalize
 from sklearn.decomposition import PCA
 from sklearn.metrics import auc as compute_area_under_curve
+from tqdm import tqdm
 
 try:
     import torch
@@ -39,6 +40,7 @@ def compute_mauve(
         featurize_model_name='gpt2-large', device_id=-1, max_text_length=1024,
         divergence_curve_discretization_size=25, mauve_scaling_factor=5,
         verbose=False, seed=25, batch_size=1, use_float64=False,
+        clustering_device_id=-1
 ):
 
     """
@@ -62,6 +64,7 @@ def compute_mauve(
     :param ``featurize_model_name``: name of the model from which features are obtained. Default 'gpt2-large'.
         We support all models which can be loaded from ``transformers.AutoModel.from_pretrained(featurize_model_name)``.
     :param ``device_id``: Device for featurization. Supply gpu_id (e.g. 0 or 3) to use GPU or -1 to use CPU.
+    :param ``clustering_device_id``: Device for clustering. Supply gpu_id (e.g. 0 or 3) to use GPU or -1 to use CPU.
     :param ``max_text_length``: maximum number of tokens to consider. Default 1024.
     :param ``divergence_curve_discretization_size``: Number of points to consider on the divergence curve. Default 25.
         Larger values do not offer much of a difference. 
@@ -110,6 +113,7 @@ def compute_mauve(
                          explained_variance=kmeans_explained_var,
                          num_redo=kmeans_num_redo,
                          max_iter=kmeans_max_iter,
+                         clustering_device_id=clustering_device_id,
                          seed=seed, verbose=verbose)
     t2 = time.time()
     if verbose:
@@ -186,6 +190,7 @@ def cluster_feats(p, q, num_clusters,
                   pca_max_data=-1,
                   explained_variance=0.9,
                   num_redo=5, max_iter=500,
+                  clustering_device_id=-1,
                   seed=0, verbose=False):
     assert 0 < explained_variance < 1
     if verbose:
@@ -211,12 +216,15 @@ def cluster_feats(p, q, num_clusters,
     # Cluster
     data1 = data1.astype(np.float32)
     t1 = time.time()
-    kmeans = faiss.Kmeans(data1.shape[1], num_clusters, niter=max_iter,
-                          verbose=verbose, nredo=num_redo, update_index=True,
-                          seed=seed+2)
-    kmeans.train(data1)
-    _, labels = kmeans.index.search(data1, 1)
-    labels = labels.reshape(-1)
+    # K-Means on GPU
+    device = f"cuda:{clustering_device_id}" if clustering_device_id >= 0 else "cpu"
+    kmeans = KMeans(n_clusters=num_clusters, n_init=num_redo, max_iter=max_iter, device=device)
+    clusters = kmeans.fit(torch.from_numpy(data1).cuda())
+    labels = [None] * data1.shape[0]
+    for i, cluster in enumerate(clusters):
+        for index in cluster:
+            labels[index] = i
+    labels = np.array(labels)
     t2 = time.time()
     if verbose:
         print('kmeans time:', round(t2-t1, 2), 's')
@@ -264,3 +272,101 @@ def get_fronter_integral(p, q, scaling_factor=2):
             total += 0.25 * t1 - 0.5 * t2
         # else: contribution is 0 
     return total * scaling_factor
+
+# k-means through pytorch on cuda
+class KMeans:
+    def __init__(self, n_clusters, n_init=10, max_iter=300, min_variation=1e-4, device="cuda"):
+        self.n_clusters = n_clusters
+        self.n_init = n_init
+        self.max_iter = max_iter
+        self.min_variation = min_variation
+        self.device = device
+
+    def fit(self, encodings):
+        if self.n_clusters<1:
+            raise Exception(f"the number of clusters should be >=1, but got {self.n_clusters}")
+        if self.n_clusters==1:
+            clusters = [list(range(encodings.shape[0]))]
+        else:
+            best_group_index, min_loss = None, 1e10
+            for init in range(self.n_init):
+                loss = np.nan
+                while np.isnan(loss):
+                    group_index, loss = self.fit_once(encodings, init)
+                if loss < min_loss:
+                    best_group_index = group_index
+                    min_loss = loss
+            clusters = [[] for _ in range(self.n_clusters)]
+            for i,index in enumerate(best_group_index.tolist()):
+                clusters[index].append(i)
+        return clusters
+
+    @torch.no_grad()
+    def fit_once(self, encodings, init):
+        encodings = encodings.to(self.device)
+
+        # randomly choose n_clusters vectors as the initial clusters
+        unique_encodings = torch.unique(encodings, dim=0) # to avoid overlapped cluster centers
+        if unique_encodings.shape[0]<self.n_clusters:
+            n_clusters = unique_encodings.shape[0]
+        centers = None
+        for i,idx in enumerate(torch.randperm(unique_encodings.shape[0]).tolist()):
+            if i==0:
+                centers = unique_encodings[idx].unsqueeze(0) # the first vector is chosen as the first cluster center
+                continue
+            new_center = unique_encodings[idx].unsqueeze(0) # the other centers should not be too close to existing centers
+            if not torch.any(torch.all(torch.isclose(new_center, centers), dim=-1)):
+                centers = torch.cat([centers, new_center], dim=0)
+                if centers.shape[0]==self.n_clusters:
+                    break
+        n_clusters = centers.shape[0]
+
+        # Loop:
+        #    group vectors into clusters
+        #    update cluster centers
+        #    early stop when cluster centers nearly not moved
+        # Loss: the within-cluster sum of squares (WCSS) (i.e. variance).
+        with tqdm(total=self.max_iter, desc=f"KMeans ({init+1}/{self.n_init})") as bar:
+            for iter_step in range(self.max_iter):
+                old_centers = centers
+                group_index, loss = self.group_points(centers, encodings)
+                centers = self.update_centers(group_index, encodings, old_centers)
+                centers_max_movement = ((old_centers-centers)**2).sum(dim=-1).max().item()
+                bar.set_description(f"KMeans ({init+1}/{self.n_init}): "
+                                    f"loss: {loss:.3f} | "
+                                    f"movement: {centers_max_movement:.4f}")
+                if centers_max_movement < self.min_variation or np.isnan(loss):
+                    bar.total = iter_step + 1
+                    bar.update(1)
+                    break
+                else:
+                    bar.update(1)
+        return group_index, loss
+
+    @torch.no_grad()
+    def group_points(self, centers, encodings, capacity=int(1e10)):
+        # centers: [n_clusters, hs]
+        # encodings: [N, hs]
+        # capacity: the batch_size for iteration
+        split_len = capacity // (encodings.shape[0] * centers.shape[0])
+        split_num = np.math.ceil(encodings.shape[0] / split_len)
+        group_index = []
+        loss = 0.0
+        for i in range(split_num):
+            split_encodings = encodings[i*split_len:(i+1)*split_len, :]
+            split_distances = torch.norm(split_encodings[:,None,:] - centers[None,:,:], dim=-1)
+            group_index.append(split_distances.argmin(dim=-1).detach())
+            loss += split_distances.min(dim=-1).values.sum().item()
+        group_index = torch.cat(group_index, dim=0)
+        return group_index, loss # [n_clusters], float
+
+    @torch.no_grad()
+    def update_centers(self, group_index, encodings, old_centers):
+        sum_vec = torch.zeros_like(old_centers)
+        count_vec = torch.zeros_like(old_centers[:,0]) + 1e-6
+        index = group_index.unsqueeze(1).repeat(1, encodings.shape[1]) # [n_clusters, hs]
+        sum_vec = sum_vec.scatter_add_(dim=0, index=index, src=encodings)
+        count_vec = count_vec.scatter_add_(dim=0, index=group_index, src=torch.ones_like(group_index).float())
+        mean_vec = sum_vec.div_(count_vec.unsqueeze(1))
+        centers = mean_vec
+        return centers
